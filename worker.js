@@ -39,8 +39,8 @@ const P_S5 = 'so'+'cks5';
 
 // ECH + 指纹伪装配置
 let ECH = true;  // ECH 开关 (支持环境变量覆盖)
-let ECH_DNS = 'https://odvr.nic.cz/doh';
-const ECH_DNS_BACKUP = 'https://lh.ddd.oaifree.com/query-dns';
+let ECH_DNS = 'https://dns.alidns.com/dns-query';
+const ECH_DNS_BACKUP = 'https://sm2.doh.pub/dns-query';
 let ECH_SNI = 'cloudflare-ech.com';
 let FP = 'chrome';
 
@@ -140,7 +140,7 @@ async function pCL(text, uuid, h) {
       const baseDnsBlock = 'dns:\n  enable: true\n  default-nameserver:\n    - 223.5.5.5\n    - 119.29.29.29\n    - 114.114.114.114\n  use-hosts: true\n  nameserver:\n    - https://sm2.doh.pub/dns-query\n    - https://dns.alidns.com/dns-query\n  fallback:\n    - 8.8.4.4\n    - 208.67.220.220\n  fallback-filter:\n    geoip: true\n    geoip-code: CN\n    ipcidr:\n      - 240.0.0.0/4\n      - 127.0.0.1/32\n      - 0.0.0.0/32\n    domain:\n      - \'+.google.com\'\n      - \'+.facebook.com\'\n      - \'+.youtube.com\'\n';
       if (!/^dns:\s*(?:\n|$)/m.test(y)) y = baseDnsBlock + y;
 
-      const _bkDoH='https://do'+'h.cm.edu.kg/'+'C'+'ML'+'iu'+'ssss';
+      const _bkDoH='https://do'+'h.pub/'+'dns-'+'query';
       const ne='    "'+h+'":\n      - '+ECH_DNS+'\n      - '+ECH_DNS_BACKUP+'\n      - '+_bkDoH+'\n    "'+ECH_SNI+'":\n      - '+ECH_DNS+'\n      - '+ECH_DNS_BACKUP+'\n      - '+_bkDoH;
       const hasNsp = /^\s{2}nameserver-policy:\s*(?:\n|$)/m.test(y);
       if (hasNsp) {
