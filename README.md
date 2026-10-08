@@ -17,6 +17,7 @@
 *   **源代码作者GitHub主页**：[Alexandre_Kojeve](https://github.com/orgs/ToiCF/repositories)
 *   **GrainTCP 内核**：[nickerwen/graincf](https://github.com/nickerwen/graincf) — 高性能代理内核
 *   **TURN 协议支持**：[ToiCF/CF-Workers-TURN](https://github.com/ToiCF/CF-Workers-TURN)
+*   **SSTP / SoftEther 出站参考**：[ToiCF/CF-Workers-SoftEther](https://github.com/ToiCF/CF-Workers-SoftEther)（**GPL-3.0**）—— SSTP_DUPLEX_POST 建链、PPP 协商与手工 IPv4/TCP 封包的协议实现思路；本项目已按自身代码风格重写并复用既有工具函数，该模块遵循其 GPL-3.0 授权条款
 *   **ProxyIP 服务支持**：
     *   [cmliu/CMLiussss](https://github.com/cmliu)
     *   [RealNeoMan/威廉大佬](https://t.me/RealNeoMan)
@@ -81,6 +82,7 @@ GrainTCPV1 是一个部署在 Cloudflare 上的代理节点管理系统，提供
 |------|:---:|:---:|------|
 | GrainTCP 代理内核 | ✅ | ✅ | 4 路并发竞速建连 + BYOB 零拷贝 + Early Data |
 | TURN/TCP 中继 | ✅ | ✅ | 两版均支持匿名或长期凭证认证、A/AAAA 目标解析、IPv4/IPv6 XOR 地址和事务 ID 校验 |
+| SSTP / SoftEther 中继 | ✅ | ❌ | Worker 版脚本内完成 SSTP 建链、PPP 协商与手工 IPv4/TCP 封包；目标仅 IPv4 |
 | TURN TXT/多服务器池 | ❌ | ❌ | 两版均只支持单个服务器，不支持逗号多地址、竞速池或 `!txt` 地址池 |
 | TURNS/TLS 中继 | ✅ | ✅ | 两版控制连接和数据连接均使用 TLS；Worker 还支持域名原生 TLS 与兼容 TLS 回退 |
 | SOCKS5 代理 | ✅ | ✅ | 全局/局部模式，支持用户名密码认证 |
@@ -109,7 +111,7 @@ GrainTCPV1 是一个部署在 Cloudflare 上的代理节点管理系统，提供
 | `worker.js` | ~307 KB | Workers/Pages 完整版（可读源码，支持环境变量 + D1） |
 | `snippets.js` | ~32 KB | Snippets 精简版（压缩代码，配置写在顶部） |
 
-两份文件共同支持 TURN/TCP、TURNS/TLS、SOCKS5、HTTP、ProxyIP、ECH、订阅和后台。Worker 的 TURN/TURNS 支持全局代理、直连失败回落、查询参数、Base64/UTF-8 凭证、DNS 缓存、438 Nonce 更新与 Allocation Refresh；Snippets 的 TURN/TURNS 仅支持全局 `://` 路径，但额外实现了真实 HTTPS CONNECT。两版均不支持 TURN 多服务器池或 `!txt` 地址池。
+两份文件共同支持 TURN/TCP、TURNS/TLS、SOCKS5、HTTP、ProxyIP、ECH、订阅和后台；SSTP/SoftEther 中继仅 Worker 版支持，Snippets 版因 32KB 上限未实现。Worker 的 TURN/TURNS 支持全局代理、直连失败回落、查询参数、Base64/UTF-8 凭证、DNS 缓存、438 Nonce 更新与 Allocation Refresh；Snippets 的 TURN/TURNS 仅支持全局 `://` 路径，但额外实现了真实 HTTPS CONNECT。两版均不支持 TURN 多服务器池或 `!txt` 地址池。
 
 ---
 
@@ -555,6 +557,7 @@ TLS: 开启
 | HTTP CONNECT | 全局、局部 | 全局、局部 | Worker 应显式填写端口；Snippets 省略端口默认 80 |
 | HTTPS CONNECT | 不支持真实 TLS | 全局、局部 | Snippets 省略端口默认 443 |
 | TURN/TURNS | 全局、回落、查询参数 | 仅全局 | 默认端口 3478/5349；均只支持单个服务器 |
+| SSTP | 全局、回落、查询参数 | 不支持 | 默认端口 443，账密默认 `vpn`/`vpn`；目标仅 IPv4 |
 
 ### 使用 ProxyIP 中转
 
@@ -806,9 +809,49 @@ path=%2Fturn%3A%2F%2Fadmin%3Apassword%40relay.example.com%3A3478
 
 `%3A%2F%2F` 是 VLESS URL 中的正常编码表现，不需要在 v2rayN 的 Path 输入框中手动填写。
 
+### 使用 SSTP 中继
+
+SSTP 与 TURN 同属"经第三方隧道访问目标"，但整条链路由 Worker 脚本自己搭建：先与 SSTP 服务端建立 TLS 连接并完成 `SSTP_DUPLEX_POST` 建链，再走 PPP 的 LCP / PAP / IPCP 协商拿到服务端分配的虚拟 IPv4 地址，之后所有目标流量都以手工构造的 IPv4/TCP 包送进这条 PPP 虚拟链路。**仅 Worker 版支持**，Snippets 版未实现。
+
+> SSTP 服务端可填 VPN Gate 公共中继列表（<https://www.vpngate.net/en/volunteer_servers.aspx>）里支持 MS-SSTP / SoftEther 的节点，这类节点的 PAP 账密默认是 `vpn`/`vpn`，正好是本功能的默认值。
+
+#### 路径写法
+
+| 类型 | 写法 | 说明 |
+|------|------|------|
+| 全局 | `/sstp://用户名:密码@服务器:端口`<br>`/sstp://服务器` | 整个连接直接走 SSTP，不再尝试 Direct / SOCKS5 / HTTP / ProxyIP；端口省略默认 `443`，账密省略默认 `vpn`/`vpn` |
+| 直连失败回落 | `/sstp=用户名:密码@服务器:端口` | 连接顺序固定为 `direct → sstp` |
+| 查询参数 | `/?sstp=用户名:密码@服务器:端口` | 与 `direct` / `s5` / `proxyip` 按查询串出现顺序组合，也可追加 `&global=1` 改为全局 |
+
+#### 认证与地址格式
+
+- 不需要账密时直接写服务器地址：`/sstp://18.252.251.20`
+- 账密对应 PPP 阶段的 PAP 认证，写在 `@` 之前，格式为 `用户名:密码`
+- 账密里含 `@`、`:` 等特殊字符时按 URL 编码
+- 服务端支持域名、IPv4 和方括号 IPv6：`/sstp://[2001:db8::1]:8443`
+
+#### 节点示例
+
+```text
+vless://<uuid>@<worker域名>:443?encryption=none&security=tls&sni=<worker域名>&fp=chrome&alpn=h3&type=ws&host=<worker域名>&path=%2Fsstp%3A%2F%2Fsstp.example.com%3A443#SSTP
+```
+
+v2rayN 的 `Path` 输入框填原始路径 `/sstp://sstp.example.com:443`，导出成 VLESS 链接后会自动编码成上面的形式。
+
+#### 机制与限制
+
+- 目标域名依次用 AliDNS、Cloudflare DNS、Google DNS 解析，结果走 TURN 的同一套 180 秒 DNS 缓存，并**只取 IPv4 地址**
+- **目标仅支持 IPv4**：手工封包是 IPv4 格式，IPv6 目标直接报错，域名目标若只解析出 AAAA 也会失败
+- **只支持 TCP**，UDP 不在支持范围内
+- 发送侧按 MSS（1400 字节）分段推进序号，**没有重传与拥塞控制**，服务端丢包不会自动补发 —— 长连接和大流量的稳定性弱于直连
+- 建链与 TCP 握手各带 15 秒超时，TCP 握手最多等 30 轮
+- SSTP 中继的握手、PPP 协商和逐包封包都发生在 Worker 内，CPU 消耗明显高于直连，免费版 CPU 时间限制下不建议作为默认出口
+
+---
+
 ### 连接回落顺序
 
-全局 `://` 路径只走指定代理。没有命中全局代理时，两版默认都从 Direct 开始；Snippets 的普通顺序为 `direct → s5 → proxy`，其中 `s5` 可承载 SOCKS5、HTTP 或 HTTPS CONNECT。Worker 的 `s5` 只承载 SOCKS5/HTTP，并额外支持 TURN/TURNS 回落。
+全局 `://` 路径只走指定代理。没有命中全局代理时，两版默认都从 Direct 开始；Snippets 的普通顺序为 `direct → s5 → proxy`，其中 `s5` 可承载 SOCKS5、HTTP 或 HTTPS CONNECT。Worker 的 `s5` 只承载 SOCKS5/HTTP，并额外支持 TURN/TURNS 与 SSTP 回落。
 
 路径为纯 `/`（未指定任何代理）时，两版都会把配置中的默认 ProxyIP 作为兜底出口注入，实际顺序为 `direct → proxy`。
 
@@ -817,6 +860,7 @@ path=%2Fturn%3A%2F%2Fadmin%3Apassword%40relay.example.com%3A3478
 | `direct` | GrainTCP 竞速直连（默认 4 路并发） | GrainTCP Snippets 直连 |
 | `s5` | SOCKS5 或 HTTP CONNECT | SOCKS5、HTTP 或 HTTPS CONNECT |
 | `turn` | TURN/TURNS 中继 | 不支持查询参数回落 |
+| `sstp` | SSTP/SoftEther 中继 | 不支持 |
 | `proxy` | ProxyIP 中转 | ProxyIP 中转 |
 
 Worker 使用 `/turn=...` 或 `/turns=...` 时固定执行：
@@ -839,16 +883,18 @@ direct → SOCKS5 → ProxyIP
 direct → ProxyIP → SOCKS5
 ```
 
-Worker 还可以把 TURN/TURNS 插入顺序：
+Worker 还可以把 TURN/TURNS 与 SSTP 插入顺序：
 
 ```text
 /?direct&s5=admin:pass123@proxy.example.com:1080&turn=user:pass@turn.example.com:3478&proxyip=proxyip.example.com:443
+/?direct&sstp=vpn:vpn@sstp.example.com:443&proxyip=proxyip.example.com:443
 ```
 
 对应：
 
 ```text
 direct → SOCKS5 → TURN → ProxyIP
+direct → SSTP → ProxyIP
 ```
 
 Snippets 会忽略 `turn`/`turns` 查询回落项；其 TURN/TURNS 只能使用全局 `://` 路径。`mode` 只控制顺序，不会自动生成代理地址，必须同时提供对应的 `s5`、`turn` 或 `proxyip` 实际值。
@@ -1335,6 +1381,20 @@ ECH 开启后，系统自动对订阅内容做以下处理：
 
 - 自建：使用 coturn 等开源 TURN 服务器
 - 第三方：部分云服务商提供 TURN 服务
+
+### SSTP 相关
+
+**Q: SSTP 和 TURN 有什么区别？**
+
+TURN 是标准 STUN/TURN 协议的 TCP 中继，服务端必须是 TURN 服务器；SSTP 是微软的 VPN 协议，服务端是支持 MS-SSTP 的 SoftEther / VPN Gate 节点。两者都是"经第三方访问目标"，但 SSTP 由本项目在 Worker 里跑 PPP 与手工 TCP 栈，能力更重、限制也更多（见上文「使用 SSTP 中继」的机制与限制）。
+
+**Q: SSTP 报 `SSTP target DNS resolution failed` 或 `SSTP relay does not support IPv6 targets`？**
+
+目标只支持 IPv4。域名要能解析出 A 记录，IPv6 目标请改用直连、ProxyIP 或 TURN 出口。
+
+**Q: SSTP 能连上但打不开网页？**
+
+SSTP 发送侧没有重传与拥塞控制，丢包后不会补发。优先换用更近、更稳的 SSTP 服务端，或改回 `direct` / `proxy` 出口。
 
 ### 优选 IP 相关
 

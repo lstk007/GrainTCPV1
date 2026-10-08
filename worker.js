@@ -1109,9 +1109,478 @@ async function connectViaTurnProxy(openSocket, cfg, targetHost, targetPort, fami
   throw lastError || new Error('TURN connection failed');
 }
 
+/* ---------- SSTP / SoftEther 出口（MS-SSTP over TLS + PPP + 手工 IPv4/TCP）----------
+ * 协议依据：微软 MS-SSTP（SSTP_DUPLEX_POST 建链与帧格式）、IETF PPP RFC 1661/1332、
+ *           IPv4 RFC 791、TCP RFC 793、互联网校验和 RFC 1071。
+ * 参考实现：ToiCF/CF-Workers-SoftEther（GPL-3.0），已按本项目风格重写并复用现有工具。
+ * 链路：SSTP over TLS → PPP(LCP/PAP/IPCP) → 取 PPP 分配的虚拟 IPv4 → 手工 IPv4/TCP 封包 → 目标 TCP。
+ * 返回 { readable, writable, opened, closed, close }，与 raceSprout / _turnConnectSingle 同形，
+ * 由 tryCon 直接返回，数据泵（ws / mkQ / mkDn / mill）无需改动。
+ * 限制：目标只支持 IPv4（手工封包是 IPv4-only，IPv6 与 UDP 不支持）；发送侧无重传与拥塞控制。
+ */
+const SSTP_CONNECT_TIMEOUT_MS = 15000;
+const SSTP_HANDSHAKE_ROUNDS = 30;
+const SSTP_MSS = 1400;
+const SSTP_FLUSH_LIMIT = 32768;
+const SSTP_PPP_ADDRESS = 0xff;
+const SSTP_PPP_CONTROL = 0x03;
+const P_SD = 'SSTP_' + 'DUPLEX_' + 'POST';
+const P_SC = 'SSTP' + 'CORRELATION' + 'ID';
+const SSTP_MAGIC_PATH = '/sra_{BA195980-CD49-458b-9E23-C84EE0ADCD75}/';
+const _sstpPapUser = 'v' + 'pn';
+const _sstpPapPass = 'v' + 'pn';
+const _sstpEmpty = new Uint8Array(0);
+
+/* ---------- 字节工具（复用 TURN 模块的 _turnConcat / _turnEncoder / _turnToBytes / _turnWithTimeout） ---------- */
+const _sstpU16 = (b, o) => (b[o] << 8) | b[o + 1];
+const _sstpU32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+const _sstpRand16 = () => _sstpU16(crypto.getRandomValues(new Uint8Array(2)), 0);
+const _sstpRand32 = () => _sstpU32(crypto.getRandomValues(new Uint8Array(4)), 0);
+const _sstpIpBytes = ip => new Uint8Array(String(ip).split('.').map(Number));
+
+/* RFC 1071 互联网校验和 */
+const _sstpCksum = (d, o, n) => {
+    let sum = 0;
+    for (let i = o; i < o + n - 1; i += 2) sum += _sstpU16(d, i);
+    if (n & 1) sum += d[o + n - 1] << 8;
+    while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+    return (~sum) & 0xffff;
+};
+
+/* ---------- 读缓冲：先吃掉已有数据，读空了才向 socket 要 ---------- */
+const _sstpFill = async (ctx, timeout) => {
+    const { value, done } = timeout
+        ? await _turnWithTimeout(ctx.reader.read(), 'SSTP read timed out', timeout)
+        : await ctx.reader.read();
+    if (done || !value) throw new Error('SSTP server closed connection');
+    const chunk = _turnToBytes(value);
+    ctx.buf = ctx.buf.length ? _turnConcat(ctx.buf, chunk) : chunk;
+};
+
+const _sstpReadBytes = async (ctx, n, timeout) => {
+    while (ctx.buf.length < n) await _sstpFill(ctx, timeout);
+    const out = ctx.buf.subarray(0, n);
+    ctx.buf = ctx.buf.subarray(n);
+    return out;
+};
+
+const _sstpReadLine = async (ctx, timeout) => {
+    for (;;) {
+        const i = ctx.buf.indexOf(10);
+        if (i >= 0) {
+            const line = dec.decode(ctx.buf.subarray(0, i));
+            ctx.buf = ctx.buf.subarray(i + 1);
+            return line.replace(/\r$/, '');
+        }
+        await _sstpFill(ctx, timeout);
+    }
+};
+
+/* SSTP 帧头：4 字节，长度占低 12 位，bit15 置位，bit0 of byte1 为控制位 */
+const _sstpReadFrame = async (ctx, timeout) => {
+    const head = await _sstpReadBytes(ctx, 4, timeout);
+    const size = _sstpU16(head, 2) & 0x0fff;
+    if (size < 4) throw new Error('SSTP invalid frame length');
+    const body = size > 4 ? await _sstpReadBytes(ctx, size - 4, timeout) : _sstpEmpty;
+    return { ctrl: (head[1] & 1) !== 0, body };
+};
+
+/* ---------- SSTP 封包 ---------- */
+const _sstpDataFrame = payload => {
+    const n = 6 + payload.length;
+    const out = new Uint8Array(n);
+    out.set([0x10, 0x00, ((n >> 8) & 0x0f) | 0x80, n & 0xff, SSTP_PPP_ADDRESS, SSTP_PPP_CONTROL]);
+    out.set(payload, 6);
+    return out;
+};
+
+const _sstpCtrlFrame = (msgType, attrs = []) => {
+    const attrLen = attrs.reduce((sum, a) => sum + 4 + a.data.length, 0);
+    const out = new Uint8Array(8 + attrLen);
+    const view = new DataView(out.buffer);
+    out[0] = 0x10;
+    out[1] = 0x01;
+    view.setUint16(2, (8 + attrLen) | 0x8000);
+    view.setUint16(4, msgType);
+    view.setUint16(6, attrs.length);
+    let offset = 8;
+    for (const a of attrs) {
+        out[offset] = a.id;
+        view.setUint16(offset + 2, 4 + a.data.length);
+        out.set(a.data, offset + 4);
+        offset += 4 + a.data.length;
+    }
+    return out;
+};
+
+/* ---------- PPP 报文（RFC 1661）：协议 2B + 代码 1B + 标识 1B + 长度 2B + 选项 ---------- */
+const _sstpPpp = (proto, code, id, opts = []) => {
+    const optLen = opts.reduce((sum, o) => sum + 2 + o.data.length, 0);
+    const frame = new Uint8Array(6 + optLen);
+    const view = new DataView(frame.buffer);
+    view.setUint16(0, proto);
+    frame[2] = code;
+    frame[3] = id;
+    view.setUint16(4, 4 + optLen);
+    let offset = 6;
+    for (const o of opts) {
+        frame[offset] = o.type;
+        frame[offset + 1] = 2 + o.data.length;
+        frame.set(o.data, offset + 2);
+        offset += 2 + o.data.length;
+    }
+    return frame;
+};
+
+/* PAP 认证请求（协议 0xC023）：用户长度 + 用户 + 口令长度 + 口令 */
+const _sstpPap = (id, username, password) => {
+    const user = _turnEncoder.encode(username);
+    const pass = _turnEncoder.encode(password);
+    const payloadLen = 6 + user.length + pass.length;
+    const frame = new Uint8Array(2 + payloadLen);
+    const view = new DataView(frame.buffer);
+    view.setUint16(0, 0xc023);
+    frame[2] = 1;
+    frame[3] = id;
+    view.setUint16(4, payloadLen);
+    frame[6] = user.length;
+    frame.set(user, 7);
+    frame[7 + user.length] = pass.length;
+    frame.set(pass, 8 + user.length);
+    return frame;
+};
+
+const _sstpParsePpp = data => {
+    const o = data.length >= 2 && data[0] === SSTP_PPP_ADDRESS && data[1] === SSTP_PPP_CONTROL ? 2 : 0;
+    if (data.length - o < 4) return null;
+    const proto = _sstpU16(data, o);
+    if (proto === 0x0021) return { protocol: proto, ip: data.subarray(o + 2) };
+    if (data.length - o < 6) return null;
+    return {
+        protocol: proto,
+        code: data[o + 2],
+        id: data[o + 3],
+        payload: data.subarray(o + 6),
+        raw: data.subarray(o)
+    };
+};
+
+const _sstpParseOpts = data => {
+    const out = [];
+    for (let i = 0; i + 2 <= data.length;) {
+        const type = data[i];
+        const len = data[i + 1];
+        if (len < 2 || i + len > data.length) break;
+        out.push({ type, data: data.subarray(i + 2, i + len) });
+        i += len;
+    }
+    return out;
+};
+
+/* ---------- SSTP 建链：HTTP Upgrade + LCP + PAP + IPCP，返回 PPP 分配的虚拟 IPv4 ---------- */
+const _sstpEstablish = async (ctx, cfg) => {
+    const hello = _turnEncoder.encode(
+        P_SD + ' ' + SSTP_MAGIC_PATH + ' HTTP/1.1\r\n' +
+        'Host: ' + cfg.hostname + '\r\n' +
+        'Content-Length: 18446744073709551615\r\n' +
+        P_SC + ': {' + crypto.randomUUID() + '}\r\n\r\n'
+    );
+    const protoVer = new Uint8Array([0x00, 0x01]);
+    const mru = new Uint8Array([0x05, 0xdc]);
+    let pppId = 1;
+    await ctx.writer.write(_turnConcat(
+        hello,
+        _sstpCtrlFrame(0x0001, [{ id: 1, data: protoVer }]),
+        _sstpDataFrame(_sstpPpp(0xc021, 1, pppId++, [{ type: 1, data: mru }]))
+    ));
+    const status = await _sstpReadLine(ctx, SSTP_CONNECT_TIMEOUT_MS);
+    while ((await _sstpReadLine(ctx, SSTP_CONNECT_TIMEOUT_MS)) !== '') {}
+    if (!status.includes('200')) throw new Error('SSTP handshake rejected: ' + status);
+
+    let accepted = false, authed = false, done = false, myIp = null;
+    for (let round = 0; round < 25 && !done; round++) {
+        const frame = await _sstpReadFrame(ctx, SSTP_CONNECT_TIMEOUT_MS);
+        if (frame.ctrl) {
+            // SSTP_MSG_CALL_ACCEPTED = 2
+            if (!accepted && frame.body.length >= 2 && _sstpU16(frame.body, 0) === 2) accepted = true;
+            continue;
+        }
+        const ppp = _sstpParsePpp(frame.body);
+        if (!ppp) continue;
+        if (ppp.protocol === 0xc021) {                       // LCP
+            if (ppp.code === 1) {                            // Configure-Request → Ack
+                const ack = new Uint8Array(ppp.raw);
+                ack[2] = 2;
+                await ctx.writer.write(accepted && !authed
+                    ? _turnConcat(_sstpDataFrame(ack), _sstpDataFrame(_sstpPap(pppId++, cfg.username, cfg.password)))
+                    : _sstpDataFrame(ack));
+                if (accepted) authed = true;
+            } else if (ppp.code === 2) {                     // Configure-Ack → 发 PAP
+                accepted = true;
+                if (!authed) {
+                    await ctx.writer.write(_sstpDataFrame(_sstpPap(pppId++, cfg.username, cfg.password)));
+                    authed = true;
+                }
+            }
+        } else if (ppp.protocol === 0xc023 && ppp.code === 2) {   // PAP Ack → 发 IPCP（请求分配 IP）
+            await ctx.writer.write(_sstpDataFrame(_sstpPpp(0x8021, 1, pppId++, [{ type: 3, data: new Uint8Array(4) }])));
+        } else if (ppp.protocol === 0x8021) {                // IPCP
+            if (ppp.code === 1) {                            // Configure-Request → Ack
+                const ack = new Uint8Array(ppp.raw);
+                ack[2] = 2;
+                await ctx.writer.write(_sstpDataFrame(ack));
+            } else if (ppp.code === 3) {                     // Configure-Nak → 带服务端给的地址重发请求
+                const opt = _sstpParseOpts(ppp.payload).find(x => x.type === 3);
+                if (opt) {
+                    myIp = Array.from(opt.data).join('.');
+                    await ctx.writer.write(_sstpDataFrame(_sstpPpp(0x8021, 1, pppId++, [{ type: 3, data: opt.data }])));
+                }
+            } else if (ppp.code === 2) {                     // Configure-Ack → 拿到地址，协商完成
+                const opt = _sstpParseOpts(ppp.payload).find(x => x.type === 3);
+                if (opt) myIp = Array.from(opt.data).join('.');
+                done = true;
+            }
+        }
+    }
+    if (!myIp) throw new Error('SSTP PPP did not assign an IPv4 address');
+    return myIp;
+};
+
+/* ---------- 手工 IPv4/TCP 封包（RFC 791 / 793 / 1071），跑在 PPP 虚拟链路上 ---------- */
+const _sstpTcp = (ctx, srcIp, dstIp, dstPort) => {
+    const srcPort = 10000 + (_sstpRand16() % 50000);
+    const srcB = _sstpIpBytes(srcIp);
+    const dstB = _sstpIpBytes(dstIp);
+    let seq = _sstpRand32(), ack = 0;
+    const ipTpl = new Uint8Array(20);
+    ipTpl.set([0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 64, 6]);
+    ipTpl.set(srcB, 12);
+    ipTpl.set(dstB, 16);
+    const pseudo = new Uint8Array(12 + 20 + SSTP_MSS);   // TCP 伪首部 + 头 + 一个 MSS 载荷
+    pseudo.set(srcB, 0);
+    pseudo.set(dstB, 4);
+    pseudo[9] = 6;
+
+    /* 组一帧：SSTP(6) + PPP 协议(2) + IPv4(20) + TCP(20) + 载荷 */
+    const frame = (flags, data = _sstpEmpty) => {
+        const payload = data.length;
+        const tcpLen = 20 + payload;
+        const ipLen = 20 + tcpLen;
+        const size = 8 + ipLen;
+        const out = new Uint8Array(size);
+        const view = new DataView(out.buffer);
+        out.set([0x10, 0x00, ((size >> 8) & 0x0f) | 0x80, size & 0xff,
+            SSTP_PPP_ADDRESS, SSTP_PPP_CONTROL, 0x00, 0x21]);
+        out.set(ipTpl, 8);
+        view.setUint16(10, ipLen);
+        view.setUint16(12, _sstpRand16());
+        view.setUint16(18, _sstpCksum(out, 8, 20));
+        view.setUint16(28, srcPort);
+        view.setUint16(30, dstPort);
+        view.setUint32(32, seq);
+        view.setUint32(36, ack);
+        out[40] = 0x50;
+        out[41] = flags;
+        view.setUint16(42, 65535);
+        if (payload) out.set(data, 48);
+        pseudo[10] = tcpLen >> 8;
+        pseudo[11] = tcpLen & 0xff;
+        pseudo.set(out.subarray(28, 28 + tcpLen), 12);
+        view.setUint16(44, _sstpCksum(pseudo, 0, 12 + tcpLen));
+        return out;
+    };
+
+    /* 只认本连接这一对端口的 IPv4/TCP 包 */
+    const match = ip => {
+        if (ip.length < 40 || ip[9] !== 6) return null;
+        const ihl = (ip[0] & 0x0f) * 4;
+        if (ihl + 20 > ip.length) return null;
+        if (_sstpU16(ip, ihl) !== dstPort || _sstpU16(ip, ihl + 2) !== srcPort) return null;
+        return {
+            flags: ip[ihl + 13],
+            seq: _sstpU32(ip, ihl + 4),
+            off: ihl + ((ip[ihl + 12] >> 4) & 0x0f) * 4
+        };
+    };
+
+    const handshake = async () => {
+        await ctx.writer.write(frame(0x02));                 // SYN
+        seq = (seq + 1) >>> 0;
+        for (let i = 0; i < SSTP_HANDSHAKE_ROUNDS; i++) {
+            const pkt = await _sstpReadFrame(ctx, SSTP_CONNECT_TIMEOUT_MS);
+            if (pkt.ctrl) continue;
+            const ppp = _sstpParsePpp(pkt.body);
+            if (!ppp || ppp.protocol !== 0x0021) continue;
+            const m = match(ppp.ip);
+            if (!m || (m.flags & 0x12) !== 0x12) continue;   // SYN + ACK
+            ack = (m.seq + 1) >>> 0;
+            await ctx.writer.write(frame(0x10));             // ACK
+            return true;
+        }
+        throw new Error('SSTP TCP handshake timed out');
+    };
+
+    return {
+        frame, match, handshake,
+        get seq() { return seq; },
+        set seq(v) { seq = v >>> 0; },
+        get ack() { return ack; },
+        set ack(v) { ack = v >>> 0; }
+    };
+};
+
+/* ---------- 单条 SSTP 连接：建链 + 拿虚拟 IP + TCP 握手 + 双向桥接 ---------- */
+async function _sstpConnectSingle(openSocket, cfg, targetAddress, targetPort) {
+    let socket = null, reader = null, writer = null, closed = false, resolveClosed, controller = null;
+    const closedPromise = new Promise(resolve => { resolveClosed = resolve; });
+    const close = () => {
+        if (closed) return;
+        closed = true;
+        try { reader?.cancel(); } catch {}
+        try { reader?.releaseLock(); } catch {}
+        try { writer?.releaseLock(); } catch {}
+        try { socket?.close(); } catch {}
+        resolveClosed();
+    };
+    try {
+        socket = await _turnOpenNative(openSocket, cfg.hostname, cfg.port, true);
+        writer = socket.writable.getWriter();
+        reader = socket.readable.getReader();
+        const ctx = { reader, writer, buf: new Uint8Array(0) };
+        const myIp = await _sstpEstablish(ctx, cfg);
+        const tcp = _sstpTcp(ctx, myIp, targetAddress, targetPort);
+        await tcp.handshake();
+
+        const readable = new ReadableStream({
+            start(c) { controller = c; },
+            cancel: close
+        });
+
+        /* 下行：收 PPP 内的 IPv4 包 → 剥头取 TCP 载荷 → 攒批投递给 ws，
+         * 空缓冲或攒到上限就回一个 ACK，FIN 时收尾并关连接。 */
+        const pump = async () => {
+            let pending = [], pendingLen = 0;
+            const flush = () => {
+                if (!pendingLen) return;
+                controller.enqueue(pending.length === 1 ? pending[0] : _turnConcat(...pending));
+                pending = [];
+                pendingLen = 0;
+                writer.write(tcp.frame(0x10)).catch(() => {});
+            };
+            for (;;) {
+                const pkt = await _sstpReadFrame(ctx);
+                if (pkt.ctrl) continue;
+                const ppp = _sstpParsePpp(pkt.body);
+                if (!ppp || ppp.protocol !== 0x0021) continue;
+                const m = tcp.match(ppp.ip);
+                if (!m) continue;
+                if (m.off < ppp.ip.length) {
+                    const data = ppp.ip.subarray(m.off);
+                    if (data.length) {
+                        tcp.ack = (m.seq + data.length) >>> 0;
+                        pending.push(new Uint8Array(data));
+                        pendingLen += data.length;
+                    }
+                }
+                if (m.flags & 0x01) {                          // FIN
+                    flush();
+                    tcp.ack = (tcp.ack + 1) >>> 0;
+                    writer.write(tcp.frame(0x11)).catch(() => {});
+                    controller.close();
+                    close();
+                    return;
+                }
+                if (ctx.buf.length < 4 || pendingLen >= SSTP_FLUSH_LIMIT) flush();
+            }
+        };
+        pump().catch(() => { try { controller?.close(); } catch {} close(); });
+
+        /* 上行：按 MSS 切段，每段一个 PSH+ACK，写完推进 seq */
+        const writable = new WritableStream({
+            async write(chunk) {
+                const data = _turnToBytes(chunk);
+                if (data.length <= SSTP_MSS) {
+                    await writer.write(tcp.frame(0x18, data));
+                    tcp.seq = (tcp.seq + data.length) >>> 0;
+                    return;
+                }
+                const frames = [];
+                for (let o = 0; o < data.length; o += SSTP_MSS) {
+                    const seg = data.subarray(o, Math.min(o + SSTP_MSS, data.length));
+                    frames.push(tcp.frame(0x18, seg));
+                    tcp.seq = (tcp.seq + seg.length) >>> 0;
+                }
+                await writer.write(_turnConcat(...frames));
+            },
+            close: () => { writer.write(tcp.frame(0x11)).catch(() => {}); },
+            abort: close
+        });
+
+        return { readable, writable, opened: Promise.resolve(), closed: closedPromise, close };
+    } catch (error) {
+        close();
+        throw error;
+    }
+}
+
+/* ---------- 目标解析与逐地址重试（IPv4-only，AAAA 直接跳过） ---------- */
+async function connectViaSstpProxy(openSocket, cfg, targetHost, targetPort, familyHint = 'domain') {
+    const host = _turnStripBrackets(targetHost);
+    if (_turnIsIPv6(host)) throw new Error('SSTP relay does not support IPv6 targets');
+    const targets = (await _turnResolveTarget(host, familyHint)).filter(t => t.family === 'ipv4');
+    if (!targets.length) throw new Error('SSTP target DNS resolution failed');
+    let lastError = null;
+    for (const target of targets) {
+        try {
+            return await _sstpConnectSingle(openSocket, cfg, target.address, targetPort);
+        } catch (error) {
+            lastError = error;
+        }
+    }
+    throw lastError || new Error('SSTP connection failed');
+}
+
+/* ---------- 路径/查询参数解析：:// 为全局代理，= 为直连失败后回落 ---------- */
+const _sstpParseEndpoint = value => {
+    const text = String(value || '').trim();
+    if (!text) throw new Error('SSTP invalid server');
+    const at = text.lastIndexOf('@');
+    let auth = at >= 0 ? text.slice(0, at) : '';
+    let hostPort = at >= 0 ? text.slice(at + 1) : text;
+    try { auth = decodeURIComponent(auth); } catch {}
+    try { hostPort = decodeURIComponent(hostPort); } catch {}
+    let username = _sstpPapUser, password = _sstpPapPass;
+    if (auth) {
+        const sep = auth.indexOf(':');
+        if (sep >= 0) { username = auth.slice(0, sep); password = auth.slice(sep + 1); }
+    }
+    const [hostname, port] = _turnParseHostPort(hostPort, 443);
+    if (!hostname || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('SSTP invalid server');
+    return { hostname: _turnStripBrackets(hostname), port, username, password };
+};
+
+function parseSstpProxyConfig(value) {
+    let text = String(value || '');
+    for (let i = 0; i < 2; i++) {
+        try {
+            const decoded = decodeURIComponent(text);
+            if (decoded === text) break;
+            text = decoded;
+        } catch {
+            break;
+        }
+    }
+    const match = text.match(new RegExp('(?:^|/)(sstp)(?:(://)|=)([^?#\\s]+)', 'i'));
+    if (!match) return null;
+    try {
+        return { cfg: _sstpParseEndpoint(match[3]), global: Boolean(match[2]) };
+    } catch {
+        return null;
+    }
+}
 /* ---------- URL 路由解析：路径快捷方式 + 查询参数 ---------- */
 function pCfg(url, path, fbPIP = null) {
-  let pIP = null, s5 = null, enS = null, turn = null, gP = null, order = null;
+  let pIP = null, s5 = null, enS = null, turn = null, sstp = null, gP = null, order = null;
 
   // 1a. TURN/TURNS：:// 为全局代理，= 为直连失败后回落
   const turnRoute = parseTurnProxyConfig('/' + path);
@@ -1123,7 +1592,20 @@ function pCfg(url, path, fbPIP = null) {
       turn = turnRoute.cfg;
       order = ['direct', 'turn'];
     }
-    return { pIP, s5, enS, turn, gP, order };
+    return { pIP, s5, enS, turn, sstp, gP, order };
+  }
+
+  // 1a'. SSTP：:// 为全局代理，= 为直连失败后回落
+  const sstpRoute = parseSstpProxyConfig('/' + path);
+  if (sstpRoute) {
+    if (sstpRoute.global) {
+      gP = { type: 'sstp', cfg: sstpRoute.cfg };
+      order = ['gP'];
+    } else {
+      sstp = sstpRoute.cfg;
+      order = ['direct', 'sstp'];
+    }
+    return { pIP, s5, enS, turn, sstp, gP, order };
   }
 
   // 1b. 全局 SOCKS5 / HTTP / HTTPS
@@ -1137,7 +1619,7 @@ function pCfg(url, path, fbPIP = null) {
       cfg
     };
     order = ['gP'];
-    return { pIP, s5, enS, turn, gP, order };
+    return { pIP, s5, enS, turn, sstp, gP, order };
   }
 
   // 1c. /proxyip= → 强制 direct, proxy
@@ -1147,7 +1629,7 @@ function pCfg(url, path, fbPIP = null) {
     const [a, p = 443] = parseAddressPort(seg);
     pIP = { address: a.includes('[') ? a.slice(1, -1) : a, port: +p };
     order = ['direct', 'proxy'];
-    return { pIP, s5, enS, turn, gP, order };
+    return { pIP, s5, enS, turn, sstp, gP, order };
   }
 
   // 1d. /s5= 或 /socks5= 或 /socks=
@@ -1157,7 +1639,7 @@ function pCfg(url, path, fbPIP = null) {
     s5 = addrParser(match[2]);
     enS = 'socks5';
     order = ['direct', 's5'];
-    return { pIP, s5, enS, turn, gP, order };
+    return { pIP, s5, enS, turn, sstp, gP, order };
   }
 
   // 1e. /http=
@@ -1166,7 +1648,7 @@ function pCfg(url, path, fbPIP = null) {
     s5 = addrParser(httpPath[1]);
     enS = 'http';
     order = ['direct', 's5'];
-    return { pIP, s5, enS, turn, gP, order };
+    return { pIP, s5, enS, turn, sstp, gP, order };
   }
 
   // 路径任意位置的 /ip= /proxyip=
@@ -1194,17 +1676,21 @@ function pCfg(url, path, fbPIP = null) {
     const [a, p = 443] = parseAddressPort(pxParam);
     pIP = { address: a.includes('[') ? a.slice(1, -1) : a, port: +p };
   }
-  for (const key of ['turn', 'turns']) {
+  for (const key of ['turn', 'turns', 'sstp']) {
     const value = url.searchParams.get(key);
-    if (!value || turn || gP) continue;
-    const parsed = parseTurnProxyConfig(key + '=' + value);
+    if (!value || turn || sstp || gP) continue;
+    const parsed = key === 'sstp'
+      ? parseSstpProxyConfig(key + '=' + value)
+      : parseTurnProxyConfig(key + '=' + value);
     if (!parsed) continue;
     if (
       url.searchParams.has('globalproxy') ||
       /^(?:1|true)$/i.test(url.searchParams.get('global') || '')
     ) {
-      gP = { type: 'turn', cfg: parsed.cfg };
+      gP = { type: key === 'sstp' ? 'sstp' : 'turn', cfg: parsed.cfg };
       order = ['gP'];
+    } else if (key === 'sstp') {
+      sstp = parsed.cfg;
     } else {
       turn = parsed.cfg;
     }
@@ -1226,27 +1712,30 @@ function pCfg(url, path, fbPIP = null) {
         if (key === 'direct') order.push('direct');
         else if (key === 's5') order.push('s5');
         else if (key === 'turn' || key === 'turns') order.push('turn');
+        else if (key === 'sstp') order.push('sstp');
         else if (key === 'proxyip') order.push('proxy');
       }
       if (order.includes('s5') && !order.includes('direct')) order.unshift('direct');
       if (order.includes('turn') && !order.includes('direct')) order.unshift('direct');
+      if (order.includes('sstp') && !order.includes('direct')) order.unshift('direct');
       if (order.includes('proxy') && !order.includes('direct')) order.unshift('direct');
       if (!order.length) {
         order = ['direct'];
         if (turn) order.push('turn');
+        if (sstp) order.push('sstp');
         order.push('s5', 'proxy');
       }
     }
   }
 
   // 路径与查询参数均未指定任何代理时，回落到内置兜底地址
-  if (!pIP && !s5 && !turn && !gP && fbPIP) {
+  if (!pIP && !s5 && !turn && !sstp && !gP && fbPIP) {
     const [a, p = 443] = parseAddressPort(fbPIP);
     pIP = { address: a.includes('[') ? a.slice(1, -1) : a, port: +p };
     if (!order.includes('proxy')) order.push('proxy');
   }
 
-  return { pIP, s5, enS, turn, gP, order };
+  return { pIP, s5, enS, turn, sstp, gP, order };
 }
 
 /* ---------- GrainTCP 原生建连：单路 + 4 路竞速 ---------- */
@@ -1264,7 +1753,7 @@ const raceSprout = (f, h, p) => {
 
 /* ---------- 按 order 回落建连 ---------- */
 const tryCon = async (fetcher, addrType, host, port, routeCfg) => {
-  const { pIP, s5, enS, turn, gP, order } = routeCfg;
+  const { pIP, s5, enS, turn, sstp, gP, order } = routeCfg;
   const openSocket = (address, options) => fetcher.connect(address, options);
   const family = addrType === 1 ? 'ipv4' : addrType === 4 ? 'ipv6' : 'domain';
 
@@ -1274,6 +1763,9 @@ const tryCon = async (fetcher, addrType, host, port, routeCfg) => {
     if (gP.type === 'http') return htConn(fetcher, addrType, host, port, gP.cfg);
     if (gP.type === 'turn') {
       return connectViaTurnProxy(openSocket, gP.cfg, host, port, family);
+    }
+    if (gP.type === 'sstp') {
+      return connectViaSstpProxy(openSocket, gP.cfg, host, port, family);
     }
   }
 
@@ -1285,6 +1777,9 @@ const tryCon = async (fetcher, addrType, host, port, routeCfg) => {
       }
       if (method === 'turn' && turn) {
         return await connectViaTurnProxy(openSocket, turn, host, port, family);
+      }
+      if (method === 'sstp' && sstp) {
+        return await connectViaSstpProxy(openSocket, sstp, host, port, family);
       }
       if (method === 's5' && s5) {
         return enS === 'http'
